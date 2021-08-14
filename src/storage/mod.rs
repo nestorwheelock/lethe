@@ -1,10 +1,12 @@
 #[cfg(unix)]
-use self::nix::*;
-#[cfg(unix)]
 mod nix;
+#[cfg(unix)]
+pub use crate::storage::nix::*;
 
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub use windows::*;
 
 use anyhow::Result;
 use thiserror::Error;
@@ -15,6 +17,17 @@ pub enum StorageError {
     BadBlock,
     #[error("other i/o error")]
     Other(#[from] std::io::Error),
+}
+
+#[derive(Debug)]
+pub struct StorageRef {
+    pub id: String,
+    pub details: StorageDetails,
+    pub children: Vec<StorageRef>,
+}
+
+pub trait StorageDevice {
+    fn access(&self) -> Result<Box<dyn StorageAccess>>;
 }
 
 pub trait StorageAccess {
@@ -51,6 +64,7 @@ pub struct StorageDetails {
     pub block_size: usize,
     pub storage_type: StorageType,
     pub mount_point: Option<String>,
+    pub label: Option<String>,
 }
 
 impl Default for StorageDetails {
@@ -60,13 +74,9 @@ impl Default for StorageDetails {
             block_size: 0,
             storage_type: StorageType::Unknown,
             mount_point: None,
+            label: None,
         }
     }
-}
-
-pub trait StorageRef {
-    fn id(&self) -> &str;
-    fn details(&self) -> &StorageDetails;
 }
 
 pub struct System {}

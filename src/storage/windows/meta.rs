@@ -18,12 +18,6 @@ use windows::access::*;
 
 use crate::storage::*;
 
-#[derive(Debug)]
-pub struct DiskDeviceInfo {
-    pub id: String,
-    pub details: StorageDetails,
-}
-
 struct PhysicalDrive {
     device_number: DWORD,
     path: String,
@@ -52,6 +46,11 @@ pub struct DeviceInterfaceDetailData {
 struct VolumeExtent {
     device_number: u32,
     starting_offset: u64,
+}
+
+struct VolumeDetails {
+    extents: Vec<VolumeExtent>,
+    label: Option<String>,
 }
 
 impl DeviceInterfaceDetailData {
@@ -106,7 +105,7 @@ impl Drop for DeviceInterfaceDetailData {
 pub struct DiskDeviceEnumerator {
     device_info_list: HDEVINFO,
     device_index: DWORD,
-    volumes: Vec<(String, Vec<VolumeExtent>)>,
+    volumes: Vec<(String, VolumeDetails)>,
 }
 
 impl DiskDeviceEnumerator {
@@ -142,7 +141,7 @@ impl Drop for DiskDeviceEnumerator {
 }
 
 impl Iterator for DiskDeviceEnumerator {
-    type Item = Vec<DiskDeviceInfo>;
+    type Item = StorageRef;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut device_interface_data: SP_DEVICE_INTERFACE_DATA = unsafe { mem::zeroed() };
@@ -198,8 +197,7 @@ impl Iterator for DiskDeviceEnumerator {
         let device_number = get_device_number(&device).unwrap();
 
         PhysicalDrive::from_device_number(device_number)
-            .and_then(|x| x.get_storage_list(&self.volumes))
-            //.map_err(|e| println!("Error: {:?}", e)) //todo: figure out how to propagate errors
+            .and_then(|p| p.describe(&self.volumes))
             .ok()
             .or_else(|| self.next()) // skip
     }
@@ -216,10 +214,7 @@ impl PhysicalDrive {
         })
     }
 
-    fn get_storage_list(
-        &self,
-        volumes: &Vec<(String, Vec<VolumeExtent>)>,
-    ) -> Result<Vec<DiskDeviceInfo>> {
+    fn describe(&self, volumes: &Vec<(String, VolumeDetails)>) -> Result<StorageRef> {
         let geometry = get_drive_geometry(&self.device)?;
         let bytes_per_sector = get_alignment_descriptor(&self.device)
             .map(|a| a.BytesPerPhysicalSector as usize)
@@ -236,11 +231,12 @@ impl PhysicalDrive {
             block_size: bytes_per_sector,
             storage_type,
             mount_point: None,
+            label: None,
         };
 
         let layout = get_drive_layout(&self.device)?;
 
-        let mut devices: Vec<DiskDeviceInfo> = Vec::new();
+        let mut devices: Vec<StorageRef> = Vec::new();
 
         let partitions = unsafe {
             slice::from_raw_parts(
@@ -272,33 +268,39 @@ impl PhysicalDrive {
                 self.device_number, x.PartitionNumber
             );
 
-            let mount_point = volumes
+            let mount_point_and_label = volumes
                 .iter()
                 .find(|v| {
-                    v.1.iter().any(|e| unsafe {
+                    v.1.extents.iter().any(|e| unsafe {
                         e.device_number == self.device_number
                             && e.starting_offset == *x.StartingOffset.QuadPart() as u64
                     })
                 })
-                .map(|v| v.0.clone());
+                .map(|v| (v.0.clone(), v.1.label.clone()));
 
-            devices.push(DiskDeviceInfo {
+            devices.push(StorageRef {
                 id: partition_path,
                 details: StorageDetails {
                     size: l as u64,
                     block_size: drive_details.block_size,
                     storage_type: StorageType::Partition,
-                    mount_point,
+                    mount_point: mount_point_and_label.iter().map(|v| v.0.clone()).next(),
+                    label: mount_point_and_label
+                        .iter()
+                        .flat_map(|v| v.1.clone())
+                        .next(),
                 },
+                children: vec![],
             })
         }
 
-        devices.push(DiskDeviceInfo {
+        let root = StorageRef {
             id: self.path.to_string(),
             details: drive_details,
-        });
+            children: devices,
+        };
 
-        Ok(devices)
+        Ok(root)
     }
 }
 
@@ -387,9 +389,9 @@ fn get_drive_geometry(device: &DeviceFile) -> Result<winioctl::DISK_GEOMETRY_EX>
     }
 }
 
-fn get_volumes() -> Result<Vec<(String, Vec<VolumeExtent>)>> {
+fn get_volumes() -> Result<Vec<(String, VolumeDetails)>> {
     let drives = unsafe { fileapi::GetLogicalDrives() };
-    let mut volumes: Vec<(String, Vec<VolumeExtent>)> = Vec::new();
+    let mut volumes: Vec<(String, VolumeDetails)> = Vec::new();
 
     for c in b'A'..b'Z' + 1 {
         if drives & (1 << (c - b'A') as u32) != 0 {
@@ -398,9 +400,16 @@ fn get_volumes() -> Result<Vec<(String, Vec<VolumeExtent>)>> {
                 Ok(x) => x,
                 _ => continue,
             };
+            let volume_label = get_volume_label(device_path.as_str()).ok();
             let device = DeviceFile::open(volume_path.as_str(), false)?;
             match get_volume_extents(&device) {
-                Ok(e) => volumes.push((device_path, e)),
+                Ok(e) => volumes.push((
+                    device_path,
+                    VolumeDetails {
+                        label: volume_label,
+                        extents: e,
+                    },
+                )),
                 _ => {}
             }
         }
@@ -468,6 +477,32 @@ fn get_volume_path_from_mount_point(path: &str) -> Result<String> {
         unsafe { WideCString::from_ptr_str(volume_name_buffer.as_ptr()) }.to_string_lossy();
 
     Ok(normalize_volume_path(full_volume_path.as_str()))
+}
+
+fn get_volume_label(path: &str) -> Result<String> {
+    const MAX_PATH: usize = 1024;
+    let mut volume_name_buffer: [WCHAR; MAX_PATH] = [0; MAX_PATH];
+    unsafe {
+        if fileapi::GetVolumeInformationW(
+            WideCString::from_str(path.clone()).unwrap().as_ptr(),
+            volume_name_buffer.as_mut_ptr(),
+            MAX_PATH as DWORD,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            0 as DWORD,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error())
+                .context(format!("Unable to get volume label from {}.", path));
+        }
+    }
+
+    let volume_label =
+        unsafe { WideCString::from_ptr_str(volume_name_buffer.as_ptr()) }.to_string_lossy();
+
+    Ok(volume_label)
 }
 
 winapi::STRUCT! {

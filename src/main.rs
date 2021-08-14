@@ -1,7 +1,5 @@
 #![recursion_limit = "256"]
 
-use std::rc::Rc;
-
 #[macro_use]
 extern crate anyhow;
 use anyhow::{Context, Result};
@@ -12,6 +10,13 @@ use clap::{App, AppSettings, Arg, SubCommand};
 #[macro_use]
 extern crate prettytable;
 use prettytable::{format, Table};
+
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate serde_derive;
+
+#[cfg(target_os = "macos")]
+extern crate plist;
 
 use ::console::style;
 use indicatif::HumanBytes;
@@ -100,7 +105,7 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    let storage_devices = System::get_storage_devices().unwrap_or_else(|err| {
+    let storage_devices = System::enumerate_storage_devices().unwrap_or_else(|err| {
         eprintln!("Unable to enumerate storage devices. {:#}", err);
 
         if cfg!(linux) {
@@ -115,8 +120,7 @@ fn main() -> Result<()> {
 
         std::process::exit(1);
     });
-
-    let ids = idshortcuts::IdShortcuts::from(storage_devices.iter().map(|r| r.id()).collect());
+    let storage_repo = storage_repo::StorageRepo::from(storage_devices);
 
     let frontend = cli::ConsoleFrontend::new();
 
@@ -124,26 +128,36 @@ fn main() -> Result<()> {
         ("list", _) => {
             let mut t = Table::new();
             t.set_format(*format::consts::FORMAT_CLEAN);
-            t.set_titles(row!["Device ID", "Short ID", "Size", "Type", "Mount Point",]);
-            for x in storage_devices {
-                t.add_row(row![
-                    style(x.id()).bold(),
-                    style(ids.get_short(x.id()).unwrap_or(&"".to_owned())).bold(),
-                    HumanBytes(x.details().size),
-                    x.details().storage_type,
-                    (x.details().mount_point)
-                        .as_ref()
-                        .unwrap_or(&"".to_string())
+            t.set_titles(row![
+                "Device ID",
+                "Short ID",
+                "Size",
+                "Type",
+                "Label",
+                "Mount Point",
+            ]);
+
+            let format_device = |tt: &mut Table, x: &StorageRef, level: usize| {
+                tt.add_row(row![
+                    style(format!("{}{}", " ".repeat(level * 2), &x.id)).bold(),
+                    style(storage_repo.get_short_id(&x.id).unwrap_or(&"".to_owned())).bold(),
+                    HumanBytes(x.details.size),
+                    &x.details.storage_type,
+                    (&x.details.label).as_ref().unwrap_or(&"".to_string()),
+                    (&x.details.mount_point).as_ref().unwrap_or(&"".to_string()),
                 ]);
+            };
+
+            for x in storage_repo.devices() {
+                format_device(&mut t, &x, 0);
+                for c in &x.children {
+                    format_device(&mut t, &c, 1);
+                }
             }
             t.printstd();
         }
         ("wipe", Some(cmd)) => {
-            let device_id = cmd
-                .value_of("device")
-                .map(|id| ids.get(id))
-                .flatten()
-                .ok_or(anyhow!("Invalid device ID"))?;
+            let device_id = cmd.value_of("device").ok_or(anyhow!("Invalid device ID"))?;
             let scheme_id = cmd.value_of("scheme").unwrap();
             let verification = match cmd.value_of("verify").unwrap() {
                 "no" => Verify::No,
@@ -155,9 +169,8 @@ fn main() -> Result<()> {
             let block_size = ui::args::parse_block_size(block_size_arg)
                 .context(format!("Invalid blocksize value: {}", block_size_arg))?;
 
-            let device = storage_devices
-                .iter()
-                .find(|d| d.id() == device_id)
+            let device = storage_repo
+                .find_by_id(device_id)
                 .ok_or(anyhow!("Unknown device {}", device_id))?;
             let scheme = schemes
                 .find(scheme_id)
@@ -172,23 +185,24 @@ fn main() -> Result<()> {
             let task = WipeTask::new(
                 scheme.clone(),
                 verification,
-                device.details().size,
+                device.details.size,
                 block_size,
             )?;
 
             let mut state = WipeState::default();
             state.retries_left = retries;
 
-            let mut session = frontend.wipe_session(device_id, cmd.is_present("yes"));
+            let mut session = frontend.wipe_session(&device.id, cmd.is_present("yes"));
+            session.handle(&task, &state, WipeEvent::Created);
 
-            match System::access(device) {
+            match device.access() {
                 Ok(mut access) => {
-                    if !task.run(&mut access, &mut state, &mut session) {
+                    if !task.run(access.as_mut(), &mut state, &mut session) {
                         std::process::exit(1);
                     }
                 }
                 Err(err) => {
-                    session.handle(&task, &state, WipeEvent::Fatal(Rc::from(err)));
+                    session.handle(&task, &state, WipeEvent::Fatal(err));
                     std::process::exit(1);
                 }
             }

@@ -1,31 +1,16 @@
-test_drive_path = './testing/test_drive.vdi'
+Vagrant.require_version ">= 2.2.8"
+ENV['VAGRANT_EXPERIMENTAL'] = 'disks'
 
 Vagrant.configure("2") do |config|
+  config.vm.define "hashicorp" do |h|
+    h.vm.box = "hashicorp/bionic64"
+    h.vm.provider :virtualbox
 
-  config.vm.provider "virtualbox" do |v|
-    v.memory = 1024
-    v.cpus = 2
+    h.vm.disk :disk, size: "1GB", name: "extra_storage"
 
-    v.customize ["modifyvm", :id, "--usb", "off"]
-    v.customize ["modifyvm", :id, "--usbehci", "off"]
-    v.customize ["modifyvm", :id, "--usbxhci", "off"]
-    v.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
-    v.customize ["modifyvm", :id, "--natdnsproxy1", "on"]
-
-    unless File.exist?(test_drive_path)
-      v.customize ['createhd', '--filename', test_drive_path, '--size', 99]
-    end
-    v.customize ['storageattach', :id, '--storagectl', 'IDE Controller', '--port', 1, '--device', 0, '--type', 'hdd', '--medium', test_drive_path]
-
+    h.vm.provision "shell", inline: "echo Welcome to testing Lethe"
+    h.vm.provision "shell", inline: "apt-get update"
+    h.vm.provision "shell", inline: "apt-get -y install curl build-essential"
+    h.vm.provision "shell", inline: "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal", privileged: false
   end
-
-  config.vm.define "linux" do |linux|
-    linux.vm.box = "minimal/xenial64"
-
-    linux.vm.provision "shell", inline: "echo Welcome to testing Lethe"
-    linux.vm.provision "shell", inline: "apt-get update"
-    linux.vm.provision "shell", inline: "apt-get -y install curl build-essential"
-    linux.vm.provision "shell", inline: "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal"
-  end
-
 end
